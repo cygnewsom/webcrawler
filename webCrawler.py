@@ -1,14 +1,21 @@
 import sys
 import requests
 import configparser
+import logging
 import time
-from bs4 import BeautifulSoup
+from threading import Lock
 from queue import Queue, Empty
 from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urljoin, urlsplit
-from bloom_filter import BloomFilter
-from threading import Lock
 
+from bloom_filter import BloomFilter
+from bs4 import BeautifulSoup
+
+logger = logging.getLogger('webCrawler')
+logger.setLevel(logging.DEBUG)
+fh = logging.FileHandler('webCrawler.log')
+fh.setLevel(logging.DEBUG)
+logger.addHandler(fh)
 
 class WebCrawler:
     """ The WebCrawler class implements a multithreaded web crawler starting from the base_url.
@@ -23,12 +30,13 @@ class WebCrawler:
         :param  crawled_pages:  a bloom filter used to eliminated visited pages from the BFS algorithm
         :param  total:          counter for the total number of pages being crawled
         :param  lock:           mutex lock to provent race condition when read/write crawled_pages
-        :param  time:           timer for the time spent on running the web crawler
+        :param  run_time:       timer for the time spent on running the web crawler
     """
     def __init__(self, base_url: str, cfg: configparser)->None:
         self.base_url = base_url
         self.config = cfg
-        self.closure_url = '{}://{}'.format(urlsplit(self.base_url).scheme, urlsplit(self.base_url).netloc)
+        self.closure_url = '{scheme}://{netloc}'.format(scheme=urlsplit(self.base_url).scheme,
+                                                        netloc=urlsplit(self.base_url).netloc)
         self.pool = ThreadPoolExecutor(max_workers=int(self.config['DEFAULT']['MAX_WORKER']))
         self.task_queue = Queue()
         self.task_queue.put(self.base_url)
@@ -37,7 +45,25 @@ class WebCrawler:
         self.crawled_pages.add(self.base_url)
         self.total = 1
         self.lock = Lock()
-        self.time = time.time()
+        self.run_time = time.time()
+
+    def _add_to_task_queue(self, child_url) -> None:
+        """ Add url to the task queue concurrently
+
+        If the child_url pass the bloom filter, it will be added to the task queue
+
+        :param child_url:   the url to be added to the task queue
+        :return: None
+        """
+        self.lock.acquire()
+        if child_url not in self.crawled_pages:
+            self.crawled_pages.add(child_url)
+            self.total += 1
+            self.lock.release()
+            self.task_queue.put(child_url)
+            logger.info("\t{child_url}".format(child_url=child_url))
+        else:
+            self.lock.release()
 
     def _parse_html(self, html: str, parent_url:str)->None:
         """ Parse the html content of the page from the parent_url.
@@ -51,20 +77,14 @@ class WebCrawler:
         """
         soup = BeautifulSoup(html, 'html.parser')
         links = soup.find_all('a', href=True)
-        print("{parent_url}".format(parent_url=parent_url))
-        for link in links:
+        logger.info("{parent_url}".format(parent_url=parent_url))
+        for link in set(links):
             child_url = link['href']
             if child_url.startswith('/') or child_url.startswith(self.closure_url):
                 child_url = urljoin(self.closure_url, child_url)
-                self.lock.acquire()
-                if child_url not in self.crawled_pages:
-                    self.crawled_pages.add(child_url)
-                    self.total += 1
-                    self.lock.release()
-                    print("\t{child_url}".format(child_url=child_url))
-                    self.task_queue.put(child_url)
-                else:
-                    self.lock.release()
+                if child_url.endswith('/'):
+                    child_url = child_url[:-1]
+                    self._add_to_task_queue(child_url)
 
     def _callback(self, res: requests)->None:
         """ Callback when the html page is downloaded.
@@ -73,8 +93,16 @@ class WebCrawler:
             :return None
         """
         result, url = res.result()
-        if result and result.status_code == 200 and 'html' in result.headers['content-type']:
+        if not result:
+            return
+        if result.status_code == 200 and 'html' in result.headers['content-type']:
             self._parse_html(result.text, url)
+        elif result.status_code in (301, 302):
+            redirect_url = result.headers['Locations']
+            if redirect_url.endswith('/'):
+                redirect_url = redirect_url[:-1]
+                logger.debug("{url} is redirected to {redirect_url}".format(url=url, redirect_url=redirect_url))
+                self._add_to_task_queue(redirect_url)
 
     def _get_page(self, url: str) -> (requests, str):
         """ Get the page from the url
@@ -86,7 +114,7 @@ class WebCrawler:
             res = requests.get(url, timeout=int(self.config['DEFAULT']['TIMEOUT']))
             return res, url
         except requests.RequestException:
-            return
+            return None, url
 
     def run(self) -> None:
         """ Run the webcrawler in a parallel fashion. The workers managed by
@@ -103,15 +131,15 @@ class WebCrawler:
             except Empty:
                 return
             except Exception as e:
-                print(e)
+                logger.debug(e)
                 continue
 
     def report(self) -> None:
         """ Report the wall time and total pages on the web crawler
         """
         self.pool.shutdown(wait=True)
-        self.time = time.time() - self.time
-        print("{time:.2f} seconds is spent to crawl on {total} pages".format(time=self.time, total=self.total))
+        self.run_time = time.time() - self.run_time
+        logger.info("{time:.2f} seconds is spent to crawl on {total} pages".format(time=self.run_time, total=self.total))
 
 
 if __name__ == '__main__':
@@ -124,7 +152,7 @@ if __name__ == '__main__':
         print("Please specify the scheme in either http or https.")
         exit(1)
     config = configparser.ConfigParser()
-    config.read('config')
+    config.read('crawler_config')
     crawler = WebCrawler(inputUrl, config)
     crawler.run()
     crawler.report()
