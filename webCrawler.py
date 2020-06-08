@@ -4,7 +4,7 @@ import configparser
 import logging
 import time
 from threading import Lock
-from queue import Queue, Empty
+from queue import Queue, Empty, Full
 from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urljoin, urlsplit
 
@@ -15,6 +15,8 @@ logger = logging.getLogger('webCrawler')
 logger.setLevel(logging.DEBUG)
 fh = logging.FileHandler('webCrawler.log')
 fh.setLevel(logging.DEBUG)
+formatter = logging.Formatter('%(levelname)s: %(message)s')
+fh.setFormatter(formatter)
 logger.addHandler(fh)
 
 class WebCrawler:
@@ -37,11 +39,11 @@ class WebCrawler:
         self.config = cfg
         self.closure_url = '{scheme}://{netloc}'.format(scheme=urlsplit(self.base_url).scheme,
                                                         netloc=urlsplit(self.base_url).netloc)
-        self.pool = ThreadPoolExecutor(max_workers=int(self.config['DEFAULT']['MAX_WORKER']))
+        self.pool = ThreadPoolExecutor(max_workers=int(self.config['MAX_WORKER']))
         self.task_queue = Queue()
         self.task_queue.put(self.base_url)
-        self.crawled_pages = BloomFilter(max_elements=int(self.config['DEFAULT']['MAX_ELEMENTS']),
-                                         error_rate=float(self.config['DEFAULT']['ERROR_RATE']))
+        self.crawled_pages = BloomFilter(max_elements=int(self.config['MAX_ELEMENTS']),
+                                         error_rate=float(self.config['ERROR_RATE']))
         self.crawled_pages.add(self.base_url)
         self.total = 1
         self.lock = Lock()
@@ -55,17 +57,21 @@ class WebCrawler:
         :param child_url:   the url to be added to the task queue
         :return: None
         """
-        self.lock.acquire()
+        self.lock.acquire(timeout=int(self.config['TIMEOUT']))
         if child_url not in self.crawled_pages:
             self.crawled_pages.add(child_url)
             self.total += 1
             self.lock.release()
-            self.task_queue.put(child_url)
-            logger.info("\t{child_url}".format(child_url=child_url))
+            try:
+                self.task_queue.put(child_url, block=True, timeout=int(self.config['TIMEOUT']))
+            except Full:
+                logger.error("Task queue full when putting {child_url}".format(child_url=child_url))
+            else:
+                logger.info("\t{child_url}".format(child_url=child_url))
         else:
             self.lock.release()
 
-    def _parse_html(self, html: str, parent_url:str)->None:
+    def _parse_html(self, html: str, parent_url: str) -> None:
         """ Parse the html content of the page from the parent_url.
 
             Get all the urls (must start with the closure_url as the stopping condition)
@@ -86,7 +92,7 @@ class WebCrawler:
                     child_url = child_url[:-1]
                     self._add_to_task_queue(child_url)
 
-    def _callback(self, res: requests)->None:
+    def _callback(self, res: requests) -> None:
         """ Callback when the html page is downloaded.
 
             :param  res: the request used to fetch the html page in _get_page
@@ -111,7 +117,7 @@ class WebCrawler:
             :return (requests, url)
         """
         try:
-            res = requests.get(url, timeout=int(self.config['DEFAULT']['TIMEOUT']))
+            res = requests.get(url, timeout=int(self.config['TIMEOUT']))
             return res, url
         except requests.RequestException:
             return None, url
@@ -125,13 +131,13 @@ class WebCrawler:
         """
         while True:
             try:
-                target_url = self.task_queue.get(timeout=int(self.config['DEFAULT']['TIMEOUT']))
+                target_url = self.task_queue.get(timeout=int(self.config['TIMEOUT']))
                 job = self.pool.submit(self._get_page, target_url)
                 job.add_done_callback(self._callback)
             except Empty:
                 return
             except Exception as e:
-                logger.debug(e)
+                logger.warning(e)
                 continue
 
     def report(self) -> None:
@@ -146,13 +152,15 @@ if __name__ == '__main__':
     if len(sys.argv) < 2:
         print("Please provide the base url for the web crawler to start. "
               "Eg. > python webCrawler.py http(s)://www.[my_root].com")
+        logger.error("Not enough arguments provided from command {argv}. Quit.".format(argv=str(sys.argv)))
         exit(1)
     inputUrl = sys.argv[1]
     if not (inputUrl.startswith('http://') or inputUrl.startswith('https://')):
         print("Please specify the scheme in either http or https.")
+        logger.error("{inputUrl} provided doesn't specify scheme. Quit.".format(inputUrl=inputUrl))
         exit(1)
     config = configparser.ConfigParser()
     config.read('crawler_config')
-    crawler = WebCrawler(inputUrl, config)
+    crawler = WebCrawler(inputUrl, config['DEFAULT'])
     crawler.run()
     crawler.report()
