@@ -1,9 +1,8 @@
-import sys
 import requests
-import configparser
 import logging
 import time
 import concurrent
+import configparser
 from threading import Lock
 from queue import Queue, Empty, Full
 from concurrent.futures import ThreadPoolExecutor
@@ -32,7 +31,7 @@ class WebCrawler:
         :param  task_queue:     the task_queue that include all the urls that need to be crawled
         :param  crawled_pages:  a bloom filter used to eliminated visited pages from the BFS algorithm
         :param  total:          counter for the total number of pages being crawled
-        :param  lock:           mutex lock to provent race condition when read/write crawled_pages
+        :param  lock:           mutex lock to prevent race condition when read/write crawled_pages
         :param  run_time:       timer for the time spent on running the web crawler
     """
     def __init__(self, base_url: str, cfg: configparser)->None:
@@ -41,7 +40,7 @@ class WebCrawler:
         self.closure_url = '{scheme}://{netloc}'.format(scheme=urlsplit(self.base_url).scheme,
                                                         netloc=urlsplit(self.base_url).netloc)
         self.pool = ThreadPoolExecutor(max_workers=int(self.config['MAX_WORKER']))
-        self.task_queue = Queue(maxsize=2*int(self.config['MAX_WORKER']))
+        self.task_queue = Queue(maxsize=3*int(self.config['MAX_WORKER']))
         self.task_queue.put(self.base_url)
         self.crawled_pages = BloomFilter(max_elements=int(self.config['MAX_ELEMENTS']),
                                          error_rate=float(self.config['ERROR_RATE']))
